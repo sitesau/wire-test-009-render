@@ -1,0 +1,10 @@
+{
+  "wheel_id": 64,
+  "slug": "wire-test-009-deploytest-001",
+  "project": "wire-test-deploystep-verify",
+  "parent_t1_ref": "dryrun-test-parent-2",
+  "money_target": "",
+  "primary_kw": "deploy step dry run",
+  "intended_url": "https://wire-test-deploystep-verify.netlify.app",
+  "links": []
+}
