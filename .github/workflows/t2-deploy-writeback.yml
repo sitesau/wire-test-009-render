@@ -164,7 +164,7 @@ jobs:
             status="in_progress"; done_at_clause=""
           fi
           curl -sf -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
-            -d "{\"built_slugs\":$built,\"status\":\"$status\"$done_at_clause}"
+            -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
 
       - name: Mark failed (deploy or live-check never passed)
         # Broader than "verify failed" -- also catches a deploy step failure

@@ -1,10 +1,10 @@
 {
-  "wheel_id": 64,
-  "slug": "wire-test-009-deploytest-001",
-  "project": "wire-test-deploystep-verify",
-  "parent_t1_ref": "dryrun-test-parent-2",
+  "wheel_id": 65,
+  "slug": "wire-test-009-deploytest-vercel-001",
+  "project": "wire-test-deploystep-vercel-verify",
+  "parent_t1_ref": "dryrun-test-parent-3",
   "money_target": "",
-  "primary_kw": "deploy step dry run",
-  "intended_url": "https://wire-test-deploystep-verify.netlify.app",
+  "primary_kw": "deploy step dry run vercel",
+  "intended_url": "https://wire-test-deploystep-vercel-verify.vercel.app",
   "links": []
 }
