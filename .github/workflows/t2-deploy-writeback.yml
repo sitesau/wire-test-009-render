@@ -65,12 +65,12 @@ jobs:
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
         run: |
-          npm install -g netlify-cli >/dev/null 2>&1
+          npm install -g netlify-cli
           PROJECT="${{ steps.meta.outputs.project }}"
-          SID="$(netlify api listSites 2>/dev/null | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
+          SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
           if [ -z "$SID" ]; then
-            netlify sites:create --name "$PROJECT" --account-slug moncadaqld >/dev/null 2>&1 || true
-            SID="$(netlify api listSites 2>/dev/null | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
+            netlify sites:create --name "$PROJECT" --account-slug moncadaqld
+            SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
           fi
           [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT'"; exit 1; }
           netlify deploy --prod --dir=. --site="$SID"
