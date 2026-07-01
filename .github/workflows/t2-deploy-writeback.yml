@@ -81,12 +81,11 @@ jobs:
         env:
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
         run: |
-          npm install -g vercel >/dev/null 2>&1
+          npm install -g vercel
           PROJECT="${{ steps.meta.outputs.project }}"
-          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --scope=site-au --name="$PROJECT" 2>/dev/null | tail -1 | tr -d '\r')"
-          if [ -n "$DEP_URL" ]; then
-            vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au >/dev/null 2>&1 || true
-          fi
+          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --name="$PROJECT" | tail -1 | tr -d '\r')"
+          [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT'"; exit 1; }
+          vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN"
 
       - name: Deploy (gcs/s3/ghpages -- not wired yet)
         if: steps.meta.outputs.present == 'true' && contains(fromJSON('["gcs","s3","ghpages"]'), steps.meta.outputs.cloud_host)
