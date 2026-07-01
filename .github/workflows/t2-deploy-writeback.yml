@@ -1,17 +1,29 @@
 name: t2-deploy-writeback
 
-# Fires after Hermes commits+pushes a built T2 feeder site. The host's own
-# git integration (Netlify/Vercel/GH Pages/etc) auto-deploys on the same
-# push — this Action runs alongside it, polls for a real HTTP 200, then does
-# the DB writeback. NEVER writes DB before a confirmed-live check (evidence
-# gate — see docs/system/t2plus-automation-spec.md §6.0, 2026-07-01 bake-off
-# finding: a free model called wheel-done having built nothing).
+# Fires after Hermes commits+pushes a built T2 feeder site (raw HTML at repo
+# root). THIS ACTION DEPLOYS IT -- Hermes holds no host credentials, only a
+# git-write SSH key (blast radius = git-write only if the VPS is compromised).
+# Host creds live in this repo's Action secrets. After deploy, polls for a
+# real HTTP 200, then does the DB writeback. NEVER writes DB before a
+# confirmed-live check (evidence gate — see docs/system/t2plus-automation-spec.md
+# §6.0, 2026-07-01 bake-off finding: a free model called wheel-done having
+# built nothing).
 #
 # Expects two files at repo root, written by Hermes at build/commit time:
-#   .wheel-meta.json  — { wheel_id, slug, parent_t1_ref, money_target,
+#   .wheel-meta.json  — { wheel_id, slug, project, parent_t1_ref, money_target,
 #                          primary_kw, intended_url,
 #                          links: [{ target_url, anchor, rel }, ...] }
-#   .deploy-host      — plain text, e.g. "vercel" | "netlify" | "gcs" | "s3" | "ghpages"
+#     project = the pretty subdomain/site name (e.g. "garage-door-repair-guide"
+#     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
+#     that project name resolves to on the target host.
+#   .deploy-host      — plain text, one of: netlify | vercel | gcs | s3 | ghpages
+#
+# Host secrets required per repo (pushed once at repo-create time):
+#   netlify -> NETLIFY_AUTH_TOKEN
+#   vercel  -> VERCEL_TOKEN
+#   gcs     -> GCS_SERVICE_ACCOUNT_KEY, GCS_BUCKET   (NOT YET PUSHED to any repo -- add before routing gcs nodes here)
+#   s3      -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET (NOT YET PUSHED)
+#   ghpages -> none beyond repo write (native GH Pages, enable once in repo Settings > Pages > Source: gh-pages branch or Actions)
 
 on:
   push:
@@ -39,6 +51,7 @@ jobs:
           {
             echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
             echo "slug=$(jq -r '.slug' .wheel-meta.json)"
+            echo "project=$(jq -r '.project // .slug' .wheel-meta.json)"
             echo "parent_t1_ref=$(jq -r '.parent_t1_ref' .wheel-meta.json)"
             echo "money_target=$(jq -r '.money_target // ""' .wheel-meta.json)"
             echo "primary_kw=$(jq -r '.primary_kw // ""' .wheel-meta.json)"
@@ -46,6 +59,39 @@ jobs:
           } >> "$GITHUB_OUTPUT"
           echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
           jq -c '.links // []' .wheel-meta.json > /tmp/links.json
+
+      - name: Deploy (netlify)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'netlify'
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+        run: |
+          npm install -g netlify-cli >/dev/null 2>&1
+          PROJECT="${{ steps.meta.outputs.project }}"
+          SID="$(netlify api listSites 2>/dev/null | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
+          if [ -z "$SID" ]; then
+            netlify sites:create --name "$PROJECT" --account-slug moncadaqld >/dev/null 2>&1 || true
+            SID="$(netlify api listSites 2>/dev/null | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
+          fi
+          [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT'"; exit 1; }
+          netlify deploy --prod --dir=. --site="$SID"
+
+      - name: Deploy (vercel)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'vercel'
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: |
+          npm install -g vercel >/dev/null 2>&1
+          PROJECT="${{ steps.meta.outputs.project }}"
+          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --scope=site-au --name="$PROJECT" 2>/dev/null | tail -1 | tr -d '\r')"
+          if [ -n "$DEP_URL" ]; then
+            vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au >/dev/null 2>&1 || true
+          fi
+
+      - name: Deploy (gcs/s3/ghpages -- not wired yet)
+        if: steps.meta.outputs.present == 'true' && contains(fromJSON('["gcs","s3","ghpages"]'), steps.meta.outputs.cloud_host)
+        run: |
+          echo "::error::cloud_host=${{ steps.meta.outputs.cloud_host }} has no deploy step wired in this Action yet -- secrets not pushed, route T2 builds to netlify/vercel only until this is added."
+          exit 1
 
       - name: Poll live URL for HTTP 200 (evidence gate)
         if: steps.meta.outputs.present == 'true'
@@ -119,15 +165,18 @@ jobs:
           curl -sf -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
             -d "{\"built_slugs\":$built,\"status\":\"$status\"$done_at_clause}"
 
-      - name: Mark failed (live check never passed)
-        if: failure() && steps.verify.outcome == 'failure'
+      - name: Mark failed (deploy or live-check never passed)
+        # Broader than "verify failed" -- also catches a deploy step failure
+        # (verify never even ran, steps.verify.outcome would be 'skipped').
+        if: steps.meta.outputs.present == 'true' && failure()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
         run: |
           wheel_id="${{ steps.meta.outputs.wheel_id }}"
           code="${{ steps.verify.outputs.http_code }}"
+          reason="${code:-deploy step failed, see Action run log}"
           curl -sf -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
-            -d "{\"status\":\"failed\",\"error\":\"http $code after 5m poll\"}"
+            -d "{\"status\":\"failed\",\"error\":\"$reason\"}"
