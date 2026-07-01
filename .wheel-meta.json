@@ -1,9 +1,0 @@
-{
-  "wheel_id": 12,
-  "slug": "wire-test-009-dryrun-001",
-  "parent_t1_ref": "dryrun-test-parent",
-  "money_target": "",
-  "primary_kw": "dry run test",
-  "intended_url": "https://raw.githubusercontent.com/sitesau/wire-test-009-render/main/index.html",
-  "links": []
-}
