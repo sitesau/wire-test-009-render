@@ -27,10 +27,15 @@ jobs:
       - name: Read wheel meta
         id: meta
         run: |
+          # Not every push to this repo is a Hermes T2 build (content tweaks,
+          # manual fixes, etc). No .wheel-meta.json -> clean no-op, not a
+          # failure -- otherwise every unrelated push spams a failure email.
           if [ ! -f .wheel-meta.json ]; then
-            echo "::error::.wheel-meta.json missing — not a Hermes T2 push, skipping writeback"
-            exit 1
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "No .wheel-meta.json on this push -- not a Hermes T2 build, skipping writeback."
+            exit 0
           fi
+          echo "present=true" >> "$GITHUB_OUTPUT"
           {
             echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
             echo "slug=$(jq -r '.slug' .wheel-meta.json)"
@@ -43,6 +48,7 @@ jobs:
           jq -c '.links // []' .wheel-meta.json > /tmp/links.json
 
       - name: Poll live URL for HTTP 200 (evidence gate)
+        if: steps.meta.outputs.present == 'true'
         id: verify
         run: |
           url="${{ steps.meta.outputs.intended_url }}"
@@ -60,7 +66,7 @@ jobs:
           exit 1
 
       - name: Writeback (live confirmed)
-        if: success()
+        if: steps.meta.outputs.present == 'true' && success()
         env:
           SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
           SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
