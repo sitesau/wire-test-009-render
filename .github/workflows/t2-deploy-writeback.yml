@@ -69,7 +69,8 @@ jobs:
           PROJECT="${{ steps.meta.outputs.project }}"
           SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
           if [ -z "$SID" ]; then
-            netlify sites:create --name "$PROJECT" --account-slug moncadaqld
+            netlify api listAccountsForUser
+            netlify sites:create --name "$PROJECT"
             SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
           fi
           [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT'"; exit 1; }
