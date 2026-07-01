@@ -35,8 +35,8 @@ jobs:
             echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
             echo "slug=$(jq -r '.slug' .wheel-meta.json)"
             echo "parent_t1_ref=$(jq -r '.parent_t1_ref' .wheel-meta.json)"
-            echo "money_target=$(jq -r '.money_target // \"\"' .wheel-meta.json)"
-            echo "primary_kw=$(jq -r '.primary_kw // \"\"' .wheel-meta.json)"
+            echo "money_target=$(jq -r '.money_target // ""' .wheel-meta.json)"
+            echo "primary_kw=$(jq -r '.primary_kw // ""' .wheel-meta.json)"
             echo "intended_url=$(jq -r '.intended_url' .wheel-meta.json)"
           } >> "$GITHUB_OUTPUT"
           echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
@@ -73,7 +73,10 @@ jobs:
           live_url="${{ steps.verify.outputs.live_url }}"
           wheel_id="${{ steps.meta.outputs.wheel_id }}"
           rest="$SUPABASE_URL/rest/v1"
-          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" -H "Content-Type: application/json")
+          # deploy.* tables live outside PostgREST's default 'public' schema —
+          # Accept-Profile (GET/DELETE) / Content-Profile (POST/PATCH) select it.
+          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+                -H "Content-Type: application/json" -H "Accept-Profile: deploy" -H "Content-Profile: deploy")
 
           # 1. cloud_properties upsert (tier=T2, links_up_to=parent T1, never money)
           curl -sf -X POST "$rest/cloud_properties" \
@@ -120,5 +123,5 @@ jobs:
           code="${{ steps.verify.outputs.http_code }}"
           curl -sf -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
-            -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+            -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
             -d "{\"status\":\"failed\",\"error\":\"http $code after 5m poll\"}"
