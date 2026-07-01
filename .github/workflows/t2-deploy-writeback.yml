@@ -69,11 +69,10 @@ jobs:
           PROJECT="${{ steps.meta.outputs.project }}"
           SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}' || true)"
           if [ -z "$SID" ]; then
-            netlify api listAccountsForUser
-            netlify sites:create --name "$PROJECT"
+            netlify sites:create --name "$PROJECT" --account-slug sites-au
             SID="$(netlify api listSites | grep -B5 "\"name\": \"$PROJECT\"" | grep -oE '"site_id": "[0-9a-f-]+"' | head -1 | grep -oE '[0-9a-f-]{36}')"
           fi
-          [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT'"; exit 1; }
+          [ -n "$SID" ] || { echo "::error::could not resolve Netlify site id for '$PROJECT' in account sites-au"; exit 1; }
           netlify deploy --prod --dir=. --site="$SID"
 
       - name: Deploy (vercel)
@@ -83,9 +82,9 @@ jobs:
         run: |
           npm install -g vercel
           PROJECT="${{ steps.meta.outputs.project }}"
-          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --name="$PROJECT" | tail -1 | tr -d '\r')"
-          [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT'"; exit 1; }
-          vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN"
+          DEP_URL="$(vercel deploy --prod --yes --token="$VERCEL_TOKEN" --scope=site-au --name="$PROJECT" | tail -1 | tr -d '\r')"
+          [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT' in scope site-au"; exit 1; }
+          vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au
 
       - name: Deploy (gcs/s3/ghpages -- not wired yet)
         if: steps.meta.outputs.present == 'true' && contains(fromJSON('["gcs","s3","ghpages"]'), steps.meta.outputs.cloud_host)
