@@ -1,0 +1,124 @@
+name: t2-deploy-writeback
+
+# Fires after Hermes commits+pushes a built T2 feeder site. The host's own
+# git integration (Netlify/Vercel/GH Pages/etc) auto-deploys on the same
+# push — this Action runs alongside it, polls for a real HTTP 200, then does
+# the DB writeback. NEVER writes DB before a confirmed-live check (evidence
+# gate — see docs/system/t2plus-automation-spec.md §6.0, 2026-07-01 bake-off
+# finding: a free model called wheel-done having built nothing).
+#
+# Expects two files at repo root, written by Hermes at build/commit time:
+#   .wheel-meta.json  — { wheel_id, slug, parent_t1_ref, money_target,
+#                          primary_kw, intended_url,
+#                          links: [{ target_url, anchor, rel }, ...] }
+#   .deploy-host      — plain text, e.g. "vercel" | "netlify" | "gcs" | "s3" | "ghpages"
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  writeback:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Read wheel meta
+        id: meta
+        run: |
+          if [ ! -f .wheel-meta.json ]; then
+            echo "::error::.wheel-meta.json missing — not a Hermes T2 push, skipping writeback"
+            exit 1
+          fi
+          {
+            echo "wheel_id=$(jq -r '.wheel_id' .wheel-meta.json)"
+            echo "slug=$(jq -r '.slug' .wheel-meta.json)"
+            echo "parent_t1_ref=$(jq -r '.parent_t1_ref' .wheel-meta.json)"
+            echo "money_target=$(jq -r '.money_target // \"\"' .wheel-meta.json)"
+            echo "primary_kw=$(jq -r '.primary_kw // \"\"' .wheel-meta.json)"
+            echo "intended_url=$(jq -r '.intended_url' .wheel-meta.json)"
+          } >> "$GITHUB_OUTPUT"
+          echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+          jq -c '.links // []' .wheel-meta.json > /tmp/links.json
+
+      - name: Poll live URL for HTTP 200 (evidence gate)
+        id: verify
+        run: |
+          url="${{ steps.meta.outputs.intended_url }}"
+          code=0
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            if [ "$code" = "200" ]; then
+              echo "live_url=$url" >> "$GITHUB_OUTPUT"
+              echo "http_code=200" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            sleep 15
+          done
+          echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: Writeback (live confirmed)
+        if: success()
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          slug="${{ steps.meta.outputs.slug }}"
+          parent="${{ steps.meta.outputs.parent_t1_ref }}"
+          money="${{ steps.meta.outputs.money_target }}"
+          kw="${{ steps.meta.outputs.primary_kw }}"
+          host="${{ steps.meta.outputs.cloud_host }}"
+          live_url="${{ steps.verify.outputs.live_url }}"
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          rest="$SUPABASE_URL/rest/v1"
+          auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" -H "Content-Type: application/json")
+
+          # 1. cloud_properties upsert (tier=T2, links_up_to=parent T1, never money)
+          curl -sf -X POST "$rest/cloud_properties" \
+            "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+            -d @- <<JSON
+          {"slug":"$slug","money_target":"$money","cloud_host":"$host","intended_url":"$live_url",
+           "live_url":"$live_url","primary_kw":"$kw","tier":"T2","links_up_to":"$parent",
+           "method":"cloudlink-t2-wheel","status":"live"}
+          JSON
+
+          # 2. link_edges feed-replace (source_feed=t2-wheel, this slug only)
+          curl -sf -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
+
+          jq -c --arg slug "$slug" --arg url "$live_url" \
+            '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]' \
+            /tmp/links.json > /tmp/link_edges.json
+
+          if [ "$(jq 'length' /tmp/link_edges.json)" -gt 0 ]; then
+            curl -sf -X POST "$rest/link_edges" "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+              -d @/tmp/link_edges.json
+          fi
+
+          # 3. t2_build_queue: append this slug to built_slugs, flip done only
+          #    once feeder_count is met (structure may need multiple pushes).
+          row=$(curl -sf "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
+          built=$(echo "$row" | jq -c --arg s "$slug" '.[0].built_slugs + [$s] | unique')
+          feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
+          count=$(echo "$built" | jq 'length')
+          if [ "$count" -ge "$feeder_count" ]; then
+            status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
+          else
+            status="in_progress"; done_at_clause=""
+          fi
+          curl -sf -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
+            -d "{\"built_slugs\":$built,\"status\":\"$status\"$done_at_clause}"
+
+      - name: Mark failed (live check never passed)
+        if: failure() && steps.verify.outcome == 'failure'
+        env:
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
+        run: |
+          wheel_id="${{ steps.meta.outputs.wheel_id }}"
+          code="${{ steps.verify.outputs.http_code }}"
+          curl -sf -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
+            -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
+            -H "Content-Type: application/json" -H "Prefer: return=minimal" \
+            -d "{\"status\":\"failed\",\"error\":\"http $code after 5m poll\"}"
