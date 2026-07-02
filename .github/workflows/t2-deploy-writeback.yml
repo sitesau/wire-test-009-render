@@ -105,11 +105,15 @@ jobs:
         # Bucket = project name (mirrors _scripts/deploy_s3.py convention).
         # Public-read via bucket policy; served at the virtual-hosted object
         # URL (https://<bucket>.s3.<region>.amazonaws.com/<key>).
-        # Uses Python/boto3, NOT the `aws` CLI binary -- the CLI could not
-        # connect to any S3 endpoint pattern on this runner (tried default,
-        # --endpoint-url, virtual-hosted, path-style; all failed with
-        # "Could not connect to the endpoint URL"), while boto3 (proven
-        # working locally with the same creds) has no such issue.
+        # Uses Python/boto3, NOT the `aws` CLI binary (proven working locally
+        # with the same creds; CLI showed the identical error, so this wasn't
+        # a CLI-vs-boto3 issue).
+        # ROOT CAUSE FOUND 2026-07-02: NameResolutionError ("Failed to resolve
+        # '<bucket>.s3.<region>.amazonaws.com'") on head_bucket -- runner-side
+        # DNS flakiness, same class of bug that hit the writeback curl calls
+        # (fixed there with --retry). boto3's default retry policy does not
+        # cover this reliably, so retries are made explicit: bump botocore's
+        # own retry config AND wrap every call in a manual retry loop.
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -119,23 +123,35 @@ jobs:
         run: |
           pip install -q boto3
           python3 - <<'PYEOF'
-          import os, glob, boto3
+          import os, glob, time, boto3
           from botocore.config import Config
-          from botocore.exceptions import ClientError
+          from botocore.exceptions import ClientError, EndpointConnectionError
 
           project = os.environ["PROJECT"]
           region = os.environ["AWS_DEFAULT_REGION"]
-          s3 = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"))
+          cfg = Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"})
+          s3 = boto3.client("s3", region_name=region, config=cfg)
+
+          def with_retry(fn, *args, attempts=6, delay=5, **kwargs):
+              last_err = None
+              for i in range(attempts):
+                  try:
+                      return fn(*args, **kwargs)
+                  except EndpointConnectionError as e:
+                      last_err = e
+                      print(f"  retry {i+1}/{attempts} after connection error: {e}")
+                      time.sleep(delay)
+              raise last_err
 
           try:
-              s3.head_bucket(Bucket=project)
+              with_retry(s3.head_bucket, Bucket=project)
           except ClientError:
-              s3.create_bucket(Bucket=project, CreateBucketConfiguration={"LocationConstraint": region})
-              s3.put_public_access_block(Bucket=project, PublicAccessBlockConfiguration={
+              with_retry(s3.create_bucket, Bucket=project, CreateBucketConfiguration={"LocationConstraint": region})
+              with_retry(s3.put_public_access_block, Bucket=project, PublicAccessBlockConfiguration={
                   "BlockPublicAcls": False, "IgnorePublicAcls": False,
                   "BlockPublicPolicy": False, "RestrictPublicBuckets": False,
               })
-              s3.put_bucket_policy(Bucket=project, Policy=(
+              with_retry(s3.put_bucket_policy, Bucket=project, Policy=(
                   '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow",'
                   '"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' % project
               ))
@@ -143,13 +159,13 @@ jobs:
           # Path host convention: the built HTML file is keyword-named (e.g.
           # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html.
           for f in glob.glob("*.html"):
-              s3.upload_file(f, project, f, ExtraArgs={"ContentType": "text/html"})
+              with_retry(s3.upload_file, f, project, f, ExtraArgs={"ContentType": "text/html"})
           for pattern in ("*.jpg", "*.png", "*.txt", "*.xml"):
               for f in glob.glob(pattern):
                   if f.startswith("."):
                       continue
                   try:
-                      s3.upload_file(f, project, f)
+                      with_retry(s3.upload_file, f, project, f)
                   except Exception:
                       pass
           print(f"S3 deploy complete: bucket={project}")
