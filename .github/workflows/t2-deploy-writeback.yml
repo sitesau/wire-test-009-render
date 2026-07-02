@@ -319,8 +319,15 @@ jobs:
           # 2. link_edges feed-replace (source_feed=t2-wheel, this slug only)
           curl -sf "${RETRY[@]}" -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
 
+          # Dedup by (source_url, target_url) before upsert -- a node with 2+
+          # anchors to the same target (normal T2 prose) produces duplicate
+          # conflict keys in one batch, which Postgres rejects (21000: "ON
+          # CONFLICT DO UPDATE command cannot affect row a second time") and
+          # fails the WHOLE writeback after cloud_properties already wrote.
+          # Found 2026-07-02 proving the first real multi-feeder wheel.
           jq -c --arg slug "$slug" --arg url "$live_url" \
-            '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]' \
+            '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]
+             | unique_by([.source_url, .target_url])' \
             /tmp/links.json > /tmp/link_edges.json
 
           if [ "$(jq 'length' /tmp/link_edges.json)" -gt 0 ]; then
