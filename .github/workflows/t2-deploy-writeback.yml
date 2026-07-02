@@ -163,18 +163,25 @@ jobs:
                       time.sleep(delay)
               raise last_err
 
+          # Always (re-)apply public-access-block + bucket policy, not just on
+          # first creation -- a bucket can already exist (e.g. from an earlier
+          # partial/failed run) without the policy applied, which silently
+          # uploads into a PRIVATE bucket (403 AccessDenied on the live URL,
+          # found 2026-07-02 on bathroomrenovationcamberwell-101). Both calls
+          # are idempotent, safe to run unconditionally every deploy.
           try:
               with_retry(s3.head_bucket, Bucket=project)
           except ClientError:
               with_retry(s3.create_bucket, Bucket=project, CreateBucketConfiguration={"LocationConstraint": region})
-              with_retry(s3.put_public_access_block, Bucket=project, PublicAccessBlockConfiguration={
-                  "BlockPublicAcls": False, "IgnorePublicAcls": False,
-                  "BlockPublicPolicy": False, "RestrictPublicBuckets": False,
-              })
-              with_retry(s3.put_bucket_policy, Bucket=project, Policy=(
-                  '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow",'
-                  '"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' % project
-              ))
+
+          with_retry(s3.put_public_access_block, Bucket=project, PublicAccessBlockConfiguration={
+              "BlockPublicAcls": False, "IgnorePublicAcls": False,
+              "BlockPublicPolicy": False, "RestrictPublicBuckets": False,
+          })
+          with_retry(s3.put_bucket_policy, Bucket=project, Policy=(
+              '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow",'
+              '"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' % project
+          ))
 
           # Path host convention: the built HTML file is keyword-named (e.g.
           # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html.
