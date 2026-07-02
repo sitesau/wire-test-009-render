@@ -114,18 +114,25 @@ jobs:
         # a bucket/addressing-style problem. The diagnostic job (fresh runner)
         # resolved + curled the exact same hostnames instantly with no issue,
         # AWS_DEFAULT_REGION/AWS_ACCESS_KEY_ID secret values are clean (no
-        # whitespace, correct length). Conclusion: individual GH-hosted runner
-        # VMs occasionally land in a degraded state for AWS-hosted domains
-        # specifically -- and because retries stay on the SAME runner for the
-        # life of a job, in-job retries (tried, 11 min / 60+ attempts) hit the
-        # same broken instance every time. A `sudo` resolv.conf override was
-        # tried next and made things WORSE (job hung the full 15-min timeout
-        # with zero output -- sudo likely blocked waiting on something on that
-        # runner; reverted). Landed on: keep the retry loop as a cheap safety
-        # net for genuine transient blips, and treat a full step failure as a
-        # signal to rerun the JOB (fresh runner) rather than debug further --
-        # this matches the writeback step's flakiness, just a longer tail.
-        # Path-style addressing (kept below) is unrelated but harmless.
+        # whitespace, correct length). A `sudo` resolv.conf override was tried
+        # and made things worse (15-min hang, reverted). STILL UNRESOLVED as
+        # of 2026-07-02: 3 separate real pushes (3 separate fresh GH-hosted
+        # VMs, by design) all hit the identical NameResolutionError against
+        # *.amazonaws.com for the FULL duration of nested retries (botocore's
+        # own 10-attempt standard-mode backoff stacked with the manual loop
+        # below produced 10-15 min per failed attempt), while unrelated
+        # domains (PyPI, GitHub, Supabase) resolved fine on those same runs.
+        # Looks like intermittent GH-Actions-egress-vs-AWS-S3 connectivity
+        # trouble outside this repo's control, not a config/code bug -- but
+        # not proven beyond doubt. Retry budget trimmed way down here (was
+        # tying up the job for 10+ min per failed attempt) so a bad run fails
+        # FAST instead; t2_build_queue rows land in status=failed on any
+        # failure and are safe to re-queue for another attempt (fresh VM)
+        # rather than fighting a possibly-permanently-bad single VM in place.
+        # Do not re-attempt a fix here without new evidence -- next step if
+        # this keeps failing is to open a GH Support ticket citing runner
+        # network health, since local/diagnostic-job connectivity is proven
+        # fine and this is not something the workflow itself can control.
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -141,11 +148,11 @@ jobs:
 
           project = os.environ["PROJECT"]
           region = os.environ["AWS_DEFAULT_REGION"]
-          cfg = Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"},
-                       s3={"addressing_style": "path"})
+          cfg = Config(signature_version="s3v4", retries={"max_attempts": 2, "mode": "standard"},
+                       s3={"addressing_style": "path"}, connect_timeout=8, read_timeout=15)
           s3 = boto3.client("s3", region_name=region, config=cfg)
 
-          def with_retry(fn, *args, attempts=6, delay=5, **kwargs):
+          def with_retry(fn, *args, attempts=2, delay=3, **kwargs):
               last_err = None
               for i in range(attempts):
                   try:
