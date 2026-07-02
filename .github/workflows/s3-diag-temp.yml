@@ -1,0 +1,28 @@
+name: s3-diag-temp
+on: workflow_dispatch
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Inspect AWS_DEFAULT_REGION + try DNS
+        env:
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        run: |
+          python3 - <<'PYEOF'
+          import os
+          r = os.environ.get("AWS_DEFAULT_REGION", "")
+          print("region repr:", repr(r))
+          print("region len:", len(r))
+          print("key id len:", len(os.environ.get("AWS_ACCESS_KEY_ID", "")))
+          PYEOF
+          echo "--- resolv.conf ---"
+          cat /etc/resolv.conf
+          echo "--- nslookup s3.amazonaws.com (no region) ---"
+          getent hosts s3.amazonaws.com || echo "FAIL plain s3"
+          echo "--- nslookup s3.ap-southeast-2.amazonaws.com (hardcoded) ---"
+          getent hosts s3.ap-southeast-2.amazonaws.com || echo "FAIL hardcoded region"
+          echo "--- nslookup using actual secret region var ---"
+          getent hosts "s3.${AWS_DEFAULT_REGION}.amazonaws.com" || echo "FAIL secret-var region"
+          echo "--- curl plain https to hardcoded endpoint ---"
+          curl -sv -m 10 https://s3.ap-southeast-2.amazonaws.com/ 2>&1 | head -20
