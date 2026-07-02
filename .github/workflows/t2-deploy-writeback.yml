@@ -255,11 +255,17 @@ jobs:
           rest="$SUPABASE_URL/rest/v1"
           # deploy.* tables live outside PostgREST's default 'public' schema —
           # Accept-Profile (GET/DELETE) / Content-Profile (POST/PATCH) select it.
+          # --retry: this step saw intermittent transient connection failures
+          # (exit 6 / exit 22) on brand-new repos during testing 2026-07-02 --
+          # the exact same calls succeed instantly when run outside the GH
+          # runner, so it's runner-side network flakiness, not a logic bug.
+          # curl's own retry covers it without a custom wrapper.
+          RETRY=(--retry 4 --retry-delay 3 --retry-all-errors)
           auth=(-H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
                 -H "Content-Type: application/json" -H "Accept-Profile: deploy" -H "Content-Profile: deploy")
 
           # 1. cloud_properties upsert (tier=T2, links_up_to=parent T1, never money)
-          curl -sf -X POST "$rest/cloud_properties" \
+          curl -sf "${RETRY[@]}" -X POST "$rest/cloud_properties" \
             "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
             -d @- <<JSON
           {"slug":"$slug","money_target":"$money","cloud_host":"$host","intended_url":"$live_url",
@@ -268,20 +274,20 @@ jobs:
           JSON
 
           # 2. link_edges feed-replace (source_feed=t2-wheel, this slug only)
-          curl -sf -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
+          curl -sf "${RETRY[@]}" -X DELETE "$rest/link_edges?source_ref=eq.$slug&source_feed=eq.t2-wheel" "${auth[@]}"
 
           jq -c --arg slug "$slug" --arg url "$live_url" \
             '[.[] | {source_url:$url, target_url:.target_url, source_type:"cloud", source_ref:$slug, target_type:"cloud", anchor:.anchor, rel:(.rel // "follow"), source_feed:"t2-wheel", first_seen: (now|strftime("%Y-%m-%d"))}]' \
             /tmp/links.json > /tmp/link_edges.json
 
           if [ "$(jq 'length' /tmp/link_edges.json)" -gt 0 ]; then
-            curl -sf -X POST "$rest/link_edges" "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
+            curl -sf "${RETRY[@]}" -X POST "$rest/link_edges" "${auth[@]}" -H "Prefer: resolution=merge-duplicates,return=minimal" \
               -d @/tmp/link_edges.json
           fi
 
           # 3. t2_build_queue: append this slug to built_slugs, flip done only
           #    once feeder_count is met (structure may need multiple pushes).
-          row=$(curl -sf "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
+          row=$(curl -sf "${RETRY[@]}" "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
           built=$(echo "$row" | jq -c --arg s "$slug" '.[0].built_slugs + [$s] | unique')
           feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
           count=$(echo "$built" | jq 'length')
@@ -290,7 +296,7 @@ jobs:
           else
             status="in_progress"; done_at_clause=""
           fi
-          curl -sf -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
+          curl -sf "${RETRY[@]}" -X PATCH "$rest/t2_build_queue?id=eq.$wheel_id" "${auth[@]}" -H "Prefer: return=minimal" \
             -d "{\"built_slugs\":$built,\"status\":\"$status\",\"error\":null$done_at_clause}"
 
       - name: Mark failed (deploy or live-check never passed)
@@ -304,7 +310,7 @@ jobs:
           wheel_id="${{ steps.meta.outputs.wheel_id }}"
           code="${{ steps.verify.outputs.http_code }}"
           reason="${code:-deploy step failed, see Action run log}"
-          curl -s -w '\nHTTP=%{http_code}\n' -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
+          curl -s --retry 4 --retry-delay 3 --retry-all-errors -w '\nHTTP=%{http_code}\n' -X PATCH "$SUPABASE_URL/rest/v1/t2_build_queue?id=eq.$wheel_id" \
             -H "apikey: $SUPABASE_SERVICE_ROLE_KEY" -H "Authorization: Bearer $SUPABASE_SERVICE_ROLE_KEY" \
             -H "Content-Type: application/json" -H "Content-Profile: deploy" -H "Prefer: return=minimal" \
             -d "{\"status\":\"failed\",\"error\":\"$reason\"}" || true
