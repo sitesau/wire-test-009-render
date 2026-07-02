@@ -16,7 +16,7 @@ name: t2-deploy-writeback
 #     project = the pretty subdomain/site name (e.g. "garage-door-repair-guide"
 #     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
 #     that project name resolves to on the target host.
-#   .deploy-host      — plain text, one of: netlify | vercel | s3 | cloudflare | ghpages | surge | render
+#   .deploy-host      — plain text, one of: netlify | vercel | s3 | cloudflare | ghpages | surge | render | digitalocean | neocities
 #     (gcs is NOT wired -- blocked by a GCP org policy that disallows service-account
 #     key creation; would need Workload Identity Federation instead, not built. Do
 #     not route a node to gcs until that's done.)
@@ -38,6 +38,8 @@ name: t2-deploy-writeback
 #                 THIS repo, enabled via API on first deploy, idempotent)
 #   surge      -> SURGE_LOGIN, SURGE_TOKEN
 #   render     -> RENDER_API_KEY
+#   digitalocean -> DIGITAL_OCEAN_API_KEY
+#   neocities  -> NEOCITIES_API_KEY (PATH host, shared 'aumedia' sitename, subpath per property)
 
 on:
   push:
@@ -297,6 +299,38 @@ jobs:
           done
           [ -n "$RESOLVED" ] || { echo "::error::DO app never reported a live_url after 3min"; exit 1; }
           echo "resolved_url=${RESOLVED%/}/" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy (neocities)
+        # PATH host, like s3/gcs: free plan = ONE sitename per account
+        # ('aumedia'), so every property lives as a subdirectory
+        # (aumedia.neocities.org/<project>/), not a distinct subdomain.
+        # No per-subpath robots/sitemap (ineffective at the shared root) --
+        # ship keyword html + llms + inline JSON-LD, index via Rapid not
+        # IndexNow-per-property (the IndexNow key IS reachable at the shared
+        # account root though, so it's still submitted here). Proven live
+        # 2026-07-02 via the local deploy-neocities.sh script; ported 1:1.
+        # Hermes must set intended_url to https://aumedia.neocities.org/
+        # <project>/<kw-slug-file> in .wheel-meta.json for this host --
+        # sitename is fixed/known ('aumedia'), unlike digitalocean's random
+        # suffix, so it IS derivable in advance.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'neocities'
+        env:
+          NEOCITIES_API_KEY: ${{ secrets.NEOCITIES_API_KEY }}
+        run: |
+          [ -n "$NEOCITIES_API_KEY" ] || { echo "::error::NEOCITIES_API_KEY missing"; exit 1; }
+          PROJECT="${{ steps.meta.outputs.project }}"
+          UP_ARGS=()
+          for f in *; do
+            [ -f "$f" ] || continue
+            case "$f" in .*|.wheel-meta.json|.deploy-host) continue;; esac
+            UP_ARGS+=(-F "$PROJECT/$f=@$f")
+          done
+          KEY_FILE="$(ls *.txt 2>/dev/null | grep -iE '^[0-9a-f]{32}\.txt$' | head -1 || true)"
+          if [ -n "$KEY_FILE" ]; then
+            UP_ARGS+=(-F "$KEY_FILE=@$KEY_FILE")
+          fi
+          RESP="$(curl -s -m 60 -H "Authorization: Bearer $NEOCITIES_API_KEY" "${UP_ARGS[@]}" "https://neocities.org/api/upload")"
+          echo "$RESP" | grep -q '"result": *"success"' || { echo "::error::Neocities upload failed: $RESP"; exit 1; }
 
       - name: Deploy (cloudflare pages)
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'cloudflare'
