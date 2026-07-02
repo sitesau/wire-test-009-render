@@ -16,20 +16,26 @@ name: t2-deploy-writeback
 #     project = the pretty subdomain/site name (e.g. "garage-door-repair-guide"
 #     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
 #     that project name resolves to on the target host.
-#   .deploy-host      — plain text, one of: netlify | vercel | gcs | s3 | ghpages
+#   .deploy-host      — plain text, one of: netlify | vercel | s3 | cloudflare | ghpages
+#     (gcs is NOT wired -- blocked by a GCP org policy that disallows service-account
+#     key creation; would need Workload Identity Federation instead, not built. Do
+#     not route a node to gcs until that's done.)
 #   <32-hex>.txt      — the IndexNow key file (same convention as the local
 #     deploy-cloud.sh pipeline: filename IS the key, content IS the key, must
 #     be reachable at <live-url-host>/<key>.txt). Reuse the same key across a
 #     node's redeploys if one already exists; generate fresh only for a new
 #     node. WITHOUT this file the Action skips IndexNow submission silently
 #     (logged, not a failure) -- Bing/Yandex/DuckDuckGo will not get pinged.
+#     s3/gcs (path hosts) never got IndexNow even in the old pipeline -- RapidURL only.
 #
-# Host secrets required per repo (pushed once at repo-create time):
-#   netlify -> NETLIFY_AUTH_TOKEN
-#   vercel  -> VERCEL_TOKEN
-#   gcs     -> GCS_SERVICE_ACCOUNT_KEY, GCS_BUCKET   (NOT YET PUSHED to any repo -- add before routing gcs nodes here)
-#   s3      -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_REGION, S3_BUCKET (NOT YET PUSHED)
-#   ghpages -> none beyond repo write (native GH Pages, enable once in repo Settings > Pages > Source: gh-pages branch or Actions)
+# Host secrets required per repo (pushed once at repo-create time), all now pushed
+# to every sitesau cloudsite repo (2026-07-02):
+#   netlify    -> NETLIFY_AUTH_TOKEN
+#   vercel     -> VERCEL_TOKEN
+#   s3         -> AWS_ACCESS_KEY_ID, AWS_SECRET_ACCESS_KEY, AWS_DEFAULT_REGION
+#   cloudflare -> CLOUDFLARE_API_TOKEN, CLOUDFLARE_ACCOUNT_ID (mambaqld account)
+#   ghpages    -> none beyond the Action's own GITHUB_TOKEN (native GH Pages on
+#                 THIS repo, enabled via API on first deploy, idempotent)
 
 on:
   push:
@@ -92,10 +98,63 @@ jobs:
           [ -n "$DEP_URL" ] || { echo "::error::vercel deploy produced no URL for '$PROJECT' in scope site-au"; exit 1; }
           vercel alias set "$DEP_URL" "$PROJECT.vercel.app" --token="$VERCEL_TOKEN" --scope=site-au
 
-      - name: Deploy (gcs/s3/ghpages -- not wired yet)
-        if: steps.meta.outputs.present == 'true' && contains(fromJSON('["gcs","s3","ghpages"]'), steps.meta.outputs.cloud_host)
+      - name: Deploy (s3)
+        # Bucket = project name (mirrors _scripts/deploy_s3.py convention). Public-read
+        # static website hosting; URL is the S3 website endpoint.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
         run: |
-          echo "::error::cloud_host=${{ steps.meta.outputs.cloud_host }} has no deploy step wired in this Action yet -- secrets not pushed, route T2 builds to netlify/vercel only until this is added."
+          PROJECT="${{ steps.meta.outputs.project }}"
+          aws s3api head-bucket --bucket "$PROJECT" 2>/dev/null || {
+            aws s3api create-bucket --bucket "$PROJECT" --region "$AWS_DEFAULT_REGION" \
+              --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
+            aws s3api put-public-access-block --bucket "$PROJECT" --public-access-block-configuration \
+              BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
+            aws s3api put-bucket-policy --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
+            aws s3 website "s3://$PROJECT" --index-document index.html
+          }
+          aws s3 cp index.html "s3://$PROJECT/index.html" --content-type text/html
+          for f in *.jpg *.png *.txt *.xml; do
+            [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" 2>/dev/null || true
+          done
+
+      - name: Deploy (cloudflare pages)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'cloudflare'
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          npm install -g wrangler
+          PROJECT="${{ steps.meta.outputs.project }}"
+          npx wrangler pages project create "$PROJECT" --production-branch=main || true
+          npx wrangler pages deploy . --project-name="$PROJECT" --branch=main --commit-dirty=true
+
+      - name: Deploy (github pages)
+        # Native GH Pages on THIS repo (no external host account needed). Enables
+        # Pages via the API (idempotent) then pushes content to a gh-pages branch.
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'ghpages'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          curl -sf -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d '{"source":{"branch":"gh-pages","path":"/"}}' >/dev/null 2>&1 || true
+          rm -rf /tmp/ghpages-deploy && mkdir /tmp/ghpages-deploy
+          cp -r ./* /tmp/ghpages-deploy/ 2>/dev/null
+          rm -rf /tmp/ghpages-deploy/.git
+          cd /tmp/ghpages-deploy
+          git init -q -b gh-pages
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local add -A
+          git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local commit -q -m "deploy"
+          git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
+
+      - name: Deploy (gcs -- blocked, org policy)
+        if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'gcs'
+        run: |
+          echo "::error::cloud_host=gcs is blocked -- GCP org policy disallows service-account key creation. Needs Workload Identity Federation instead (not built). Do not route T2 builds to gcs until this is fixed."
           exit 1
 
       - name: Poll live URL for HTTP 200 (evidence gate)
