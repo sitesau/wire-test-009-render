@@ -115,21 +115,25 @@ jobs:
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
         run: |
           PROJECT="${{ steps.meta.outputs.project }}"
-          aws s3api head-bucket --bucket "$PROJECT" 2>/dev/null || {
-            aws s3api create-bucket --bucket "$PROJECT" --region "$AWS_DEFAULT_REGION" \
+          EP="https://s3.${AWS_DEFAULT_REGION}.amazonaws.com"
+          # --endpoint-url forced explicitly -- the runner's aws CLI fails to
+          # resolve the virtual-hosted *.s3.<region>.amazonaws.com pattern on
+          # its own ("Could not connect to the endpoint URL").
+          aws s3api head-bucket --endpoint-url "$EP" --bucket "$PROJECT" 2>/dev/null || {
+            aws s3api create-bucket --endpoint-url "$EP" --bucket "$PROJECT" --region "$AWS_DEFAULT_REGION" \
               --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
-            aws s3api put-public-access-block --bucket "$PROJECT" --public-access-block-configuration \
+            aws s3api put-public-access-block --endpoint-url "$EP" --bucket "$PROJECT" --public-access-block-configuration \
               BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
-            aws s3api put-bucket-policy --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
+            aws s3api put-bucket-policy --endpoint-url "$EP" --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
           }
           # Path host convention: the built HTML file is keyword-named (e.g.
           # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html
           # -- upload whatever .html exists at repo root, matching intended_url.
           for f in *.html; do
-            [ -e "$f" ] && aws s3 cp "$f" "s3://$PROJECT/$f" --content-type text/html
+            [ -e "$f" ] && aws s3 cp "$f" "s3://$PROJECT/$f" --endpoint-url "$EP" --content-type text/html
           done
           for f in *.jpg *.png *.txt *.xml; do
-            [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" 2>/dev/null || true
+            [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" --endpoint-url "$EP" 2>/dev/null || true
           done
 
       - name: Deploy (cloudflare pages)
