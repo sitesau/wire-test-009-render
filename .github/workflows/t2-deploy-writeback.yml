@@ -45,6 +45,8 @@ jobs:
   writeback:
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    permissions:
+      contents: write  # ghpages deploy step pushes a gh-pages branch to THIS repo
     steps:
       - uses: actions/checkout@v4
 
@@ -116,7 +118,12 @@ jobs:
             aws s3api put-bucket-policy --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
             aws s3 website "s3://$PROJECT" --index-document index.html
           }
-          aws s3 cp index.html "s3://$PROJECT/index.html" --content-type text/html
+          # Path host convention: the built HTML file is keyword-named (e.g.
+          # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html
+          # -- upload whatever .html exists at repo root, matching intended_url.
+          for f in *.html; do
+            [ -e "$f" ] && aws s3 cp "$f" "s3://$PROJECT/$f" --content-type text/html
+          done
           for f in *.jpg *.png *.txt *.xml; do
             [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" 2>/dev/null || true
           done
