@@ -47,6 +47,7 @@ jobs:
     timeout-minutes: 15
     permissions:
       contents: write  # ghpages deploy step pushes a gh-pages branch to THIS repo
+      pages: write     # ghpages deploy step enables Pages via the API on this repo
     steps:
       - uses: actions/checkout@v4
 
@@ -149,9 +150,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          curl -sf -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
-            -d '{"source":{"branch":"gh-pages","path":"/"}}' >/dev/null 2>&1 || true
+          # The gh-pages branch must exist BEFORE Pages can be enabled to source
+          # from it -- push the branch first, enable second.
           rm -rf /tmp/ghpages-deploy && mkdir /tmp/ghpages-deploy
           cp -r ./* /tmp/ghpages-deploy/ 2>/dev/null
           rm -rf /tmp/ghpages-deploy/.git
@@ -160,6 +160,9 @@ jobs:
           git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local add -A
           git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local commit -q -m "deploy"
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
+          curl -s -w '\nHTTP=%{http_code}\n' -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
+            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -d '{"source":{"branch":"gh-pages","path":"/"}}'
 
       - name: Deploy (gcs -- blocked, org policy)
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'gcs'
