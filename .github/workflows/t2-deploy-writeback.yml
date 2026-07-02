@@ -195,7 +195,6 @@ jobs:
             curl -s -o /dev/null -m 20 "$ep?url=$url&key=$KEY&keyLocation=https://$host/$KEY.txt" || true
           done
           echo "IndexNow submitted for $url"
-          exit 1
 
       - name: Writeback (live confirmed)
         if: steps.meta.outputs.present == 'true' && success()
