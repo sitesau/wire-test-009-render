@@ -104,37 +104,56 @@ jobs:
       - name: Deploy (s3)
         # Bucket = project name (mirrors _scripts/deploy_s3.py convention).
         # Public-read via bucket policy; served at the virtual-hosted object
-        # URL (https://<bucket>.s3.<region>.amazonaws.com/<key>), NOT the
-        # separate S3 static-website endpoint -- no `aws s3 website` needed
-        # (that call was hitting connectivity errors and isn't required for
-        # a plain public-read object GET).
+        # URL (https://<bucket>.s3.<region>.amazonaws.com/<key>).
+        # Uses Python/boto3, NOT the `aws` CLI binary -- the CLI could not
+        # connect to any S3 endpoint pattern on this runner (tried default,
+        # --endpoint-url, virtual-hosted, path-style; all failed with
+        # "Could not connect to the endpoint URL"), while boto3 (proven
+        # working locally with the same creds) has no such issue.
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: ${{ secrets.AWS_DEFAULT_REGION }}
+          PROJECT: ${{ steps.meta.outputs.project }}
         run: |
-          PROJECT="${{ steps.meta.outputs.project }}"
-          EP="https://s3.${AWS_DEFAULT_REGION}.amazonaws.com"
-          # --endpoint-url forced explicitly -- the runner's aws CLI fails to
-          # resolve the virtual-hosted *.s3.<region>.amazonaws.com pattern on
-          # its own ("Could not connect to the endpoint URL").
-          aws s3api head-bucket --endpoint-url "$EP" --bucket "$PROJECT" 2>/dev/null || {
-            aws s3api create-bucket --endpoint-url "$EP" --bucket "$PROJECT" --region "$AWS_DEFAULT_REGION" \
-              --create-bucket-configuration LocationConstraint="$AWS_DEFAULT_REGION"
-            aws s3api put-public-access-block --endpoint-url "$EP" --bucket "$PROJECT" --public-access-block-configuration \
-              BlockPublicAcls=false,IgnorePublicAcls=false,BlockPublicPolicy=false,RestrictPublicBuckets=false
-            aws s3api put-bucket-policy --endpoint-url "$EP" --bucket "$PROJECT" --policy "{\"Version\":\"2012-10-17\",\"Statement\":[{\"Sid\":\"PublicRead\",\"Effect\":\"Allow\",\"Principal\":\"*\",\"Action\":\"s3:GetObject\",\"Resource\":\"arn:aws:s3:::$PROJECT/*\"}]}"
-          }
+          pip install -q boto3
+          python3 - <<'PYEOF'
+          import os, glob, boto3
+          from botocore.config import Config
+          from botocore.exceptions import ClientError
+
+          project = os.environ["PROJECT"]
+          region = os.environ["AWS_DEFAULT_REGION"]
+          s3 = boto3.client("s3", region_name=region, config=Config(signature_version="s3v4"))
+
+          try:
+              s3.head_bucket(Bucket=project)
+          except ClientError:
+              s3.create_bucket(Bucket=project, CreateBucketConfiguration={"LocationConstraint": region})
+              s3.put_public_access_block(Bucket=project, PublicAccessBlockConfiguration={
+                  "BlockPublicAcls": False, "IgnorePublicAcls": False,
+                  "BlockPublicPolicy": False, "RestrictPublicBuckets": False,
+              })
+              s3.put_bucket_policy(Bucket=project, Policy=(
+                  '{"Version":"2012-10-17","Statement":[{"Sid":"PublicRead","Effect":"Allow",'
+                  '"Principal":"*","Action":"s3:GetObject","Resource":"arn:aws:s3:::%s/*"}]}' % project
+              ))
+
           # Path host convention: the built HTML file is keyword-named (e.g.
-          # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html
-          # -- upload whatever .html exists at repo root, matching intended_url.
-          for f in *.html; do
-            [ -e "$f" ] && aws s3 cp "$f" "s3://$PROJECT/$f" --endpoint-url "$EP" --content-type text/html
-          done
-          for f in *.jpg *.png *.txt *.xml; do
-            [ -e "$f" ] && [[ "$f" != .* ]] && aws s3 cp "$f" "s3://$PROJECT/$f" --endpoint-url "$EP" 2>/dev/null || true
-          done
+          # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html.
+          for f in glob.glob("*.html"):
+              s3.upload_file(f, project, f, ExtraArgs={"ContentType": "text/html"})
+          for pattern in ("*.jpg", "*.png", "*.txt", "*.xml"):
+              for f in glob.glob(pattern):
+                  if f.startswith("."):
+                      continue
+                  try:
+                      s3.upload_file(f, project, f)
+                  except Exception:
+                      pass
+          print(f"S3 deploy complete: bucket={project}")
+          PYEOF
 
       - name: Deploy (cloudflare pages)
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'cloudflare'
