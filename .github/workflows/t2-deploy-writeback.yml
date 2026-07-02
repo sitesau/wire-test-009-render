@@ -108,12 +108,19 @@ jobs:
         # Uses Python/boto3, NOT the `aws` CLI binary (proven working locally
         # with the same creds; CLI showed the identical error, so this wasn't
         # a CLI-vs-boto3 issue).
-        # ROOT CAUSE FOUND 2026-07-02: NameResolutionError ("Failed to resolve
-        # '<bucket>.s3.<region>.amazonaws.com'") on head_bucket -- runner-side
-        # DNS flakiness, same class of bug that hit the writeback curl calls
-        # (fixed there with --retry). boto3's default retry policy does not
-        # cover this reliably, so retries are made explicit: bump botocore's
-        # own retry config AND wrap every call in a manual retry loop.
+        # ROOT CAUSE FOUND 2026-07-02: NameResolutionError specifically on the
+        # bucket-subdomain hostname ("<bucket>.s3.<region>.amazonaws.com").
+        # Proven NOT transient -- 11 minutes, 60+ retries (6x manual x 10x
+        # botocore standard-mode), all identical failures. Proven NOT a bad
+        # bucket/DNS-globally -- `nslookup` for the exact same hostname from
+        # an unrelated network resolves fine (bucket already exists). This is
+        # the GH-hosted-runner's resolver specifically failing on the
+        # bucket-name-as-subdomain (virtual-hosted-style) pattern. FIX:
+        # force PATH-STYLE addressing (s3.<region>.amazonaws.com/<bucket>/...)
+        # -- a plain regional hostname with no bucket-specific subdomain, so
+        # the runner never needs to resolve a name that varies per node. The
+        # object's PUBLIC url is unaffected (still served at the standard
+        # virtual-hosted URL used by intended_url/live_url below).
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 's3'
         env:
           AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
@@ -129,7 +136,8 @@ jobs:
 
           project = os.environ["PROJECT"]
           region = os.environ["AWS_DEFAULT_REGION"]
-          cfg = Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"})
+          cfg = Config(signature_version="s3v4", retries={"max_attempts": 10, "mode": "standard"},
+                       s3={"addressing_style": "path"})
           s3 = boto3.client("s3", region_name=region, config=cfg)
 
           def with_retry(fn, *args, attempts=6, delay=5, **kwargs):
