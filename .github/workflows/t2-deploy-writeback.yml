@@ -9,7 +9,7 @@ name: t2-deploy-writeback
 # §6.0, 2026-07-01 bake-off finding: a free model called wheel-done having
 # built nothing).
 #
-# Expects two files at repo root, written by Hermes at build/commit time:
+# Expects at repo root, written by Hermes at build/commit time:
 #   .wheel-meta.json  — { wheel_id, slug, project, parent_t1_ref, money_target,
 #                          primary_kw, intended_url,
 #                          links: [{ target_url, anchor, rel }, ...] }
@@ -17,6 +17,12 @@ name: t2-deploy-writeback
 #     for garage-door-repair-guide.netlify.app) -- intended_url MUST match what
 #     that project name resolves to on the target host.
 #   .deploy-host      — plain text, one of: netlify | vercel | gcs | s3 | ghpages
+#   <32-hex>.txt      — the IndexNow key file (same convention as the local
+#     deploy-cloud.sh pipeline: filename IS the key, content IS the key, must
+#     be reachable at <live-url-host>/<key>.txt). Reuse the same key across a
+#     node's redeploys if one already exists; generate fresh only for a new
+#     node. WITHOUT this file the Action skips IndexNow submission silently
+#     (logged, not a failure) -- Bing/Yandex/DuckDuckGo will not get pinged.
 #
 # Host secrets required per repo (pushed once at repo-create time):
 #   netlify -> NETLIFY_AUTH_TOKEN
@@ -108,6 +114,28 @@ jobs:
             sleep 15
           done
           echo "http_code=$code" >> "$GITHUB_OUTPUT"
+          exit 1
+
+      - name: IndexNow submit (Bing/Yandex/DuckDuckGo, free)
+        # Mirrors deploy-cloud.sh's convention: a 32-hex-named .txt file at
+        # repo root IS the IndexNow key (must be reachable at <host>/<key>.txt).
+        # Hermes must commit this file alongside the built HTML -- if it's
+        # missing, submission is skipped (logged, not a failure) rather than
+        # generating+committing a key mid-Action.
+        if: steps.meta.outputs.present == 'true' && success()
+        run: |
+          KEY_FILE="$(ls *.txt 2>/dev/null | grep -iE '^[0-9a-f]{32}\.txt$' | head -1 || true)"
+          if [ -z "$KEY_FILE" ]; then
+            echo "No IndexNow key .txt at repo root -- skipping submission. Hermes should commit one (see t2-deploy-writeback.yml header)."
+            exit 0
+          fi
+          KEY="$(basename "$KEY_FILE" .txt)"
+          url="${{ steps.verify.outputs.live_url }}"
+          host="$(echo "$url" | sed -E 's#https?://([^/]+).*#\1#')"
+          for ep in https://api.indexnow.org/indexnow https://www.bing.com/indexnow https://yandex.com/indexnow; do
+            curl -s -o /dev/null -m 20 "$ep?url=$url&key=$KEY&keyLocation=https://$host/$KEY.txt" || true
+          done
+          echo "IndexNow submitted for $url"
           exit 1
 
       - name: Writeback (live confirmed)
