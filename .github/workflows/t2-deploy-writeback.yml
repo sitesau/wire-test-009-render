@@ -172,6 +172,12 @@ jobs:
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'ghpages'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The default Actions token cannot manage Pages settings even with
+          # `pages: write` declared (confirmed: 403 on the enable-Pages call
+          # despite the permission being granted -- a known GH limitation,
+          # Pages admin needs a real PAT). CLOUDSITES_PAT is the classic
+          # sitesau PAT (repo scope) pushed alongside the other secrets.
+          CLOUDSITES_PAT: ${{ secrets.CLOUDSITES_PAT }}
         run: |
           # The gh-pages branch must exist BEFORE Pages can be enabled to source
           # from it -- push the branch first, enable second.
@@ -183,8 +189,9 @@ jobs:
           git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local add -A
           git -c user.name=hermes-t2 -c user.email=hermes@sitesau.local commit -q -m "deploy"
           git push --force "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git" gh-pages:gh-pages
+          PAGES_TOKEN="${CLOUDSITES_PAT:-$GH_TOKEN}"
           curl -s -w '\nHTTP=%{http_code}\n' -X POST "https://api.github.com/repos/${{ github.repository }}/pages" \
-            -H "Authorization: Bearer $GH_TOKEN" -H "Accept: application/vnd.github+json" \
+            -H "Authorization: Bearer $PAGES_TOKEN" -H "Accept: application/vnd.github+json" \
             -d '{"source":{"branch":"gh-pages","path":"/"}}'
 
       - name: Deploy (gcs -- blocked, org policy)
