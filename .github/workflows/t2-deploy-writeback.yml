@@ -75,6 +75,7 @@ jobs:
             echo "money_target=$(jq -r '.money_target // ""' .wheel-meta.json)"
             echo "primary_kw=$(jq -r '.primary_kw // ""' .wheel-meta.json)"
             echo "intended_url=$(jq -r '.intended_url' .wheel-meta.json)"
+            printf 'node_role=%s\n' "$(jq -r '.node_role // "feeder"' .wheel-meta.json)"
           } >> "$GITHUB_OUTPUT"
           echo "cloud_host=$(cat .deploy-host | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
           jq -c '.links // []' .wheel-meta.json > /tmp/links.json
@@ -189,8 +190,15 @@ jobs:
 
           # Path host convention: the built HTML file is keyword-named (e.g.
           # bathroom-renovation-cost-camberwell.html), NOT necessarily index.html.
-          for f in glob.glob("*.html"):
+          html_files = sorted(glob.glob("*.html"))
+          if not html_files:
+              raise RuntimeError("no html files found for S3 deploy")
+          for f in html_files:
               with_retry(s3.upload_file, f, project, f, ExtraArgs={"ContentType": "text/html"})
+          if "index.html" not in html_files:
+              # T2 path-host URLs point at /index.html. Keep the keyword HTML too,
+              # but publish an index alias so the evidence gate and upstream links are live.
+              with_retry(s3.upload_file, html_files[0], project, "index.html", ExtraArgs={"ContentType": "text/html"})
           for pattern in ("*.jpg", "*.png", "*.txt", "*.xml"):
               for f in glob.glob(pattern):
                   if f.startswith("."):
@@ -230,6 +238,7 @@ jobs:
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'render'
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
+          RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
         run: |
           [ -n "$RENDER_API_KEY" ] || { echo "::error::RENDER_API_KEY missing"; exit 1; }
           PROJECT="${{ steps.meta.outputs.project }}"
@@ -238,13 +247,20 @@ jobs:
             "https://api.render.com/v1/services?name=$PROJECT&type=static_site&limit=1" \
             | jq -r '.[0].service.id // empty')"
           if [ -z "$SVCID" ]; then
-            RESP="$(curl -s -m 40 -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
-              -H "Content-Type: application/json" "https://api.render.com/v1/services" -d @- <<JSON
-          {"type":"static_site","name":"$PROJECT",
-           "repo":"$REPO_URL","branch":"main","autoDeploy":"yes",
-           "serviceDetails":{"buildCommand":"","publishPath":"."}}
-          JSON
-          )"
+            OWNER_ID="${RENDER_OWNER_ID:-}"
+            if [ -z "$OWNER_ID" ]; then
+              OWNER_ID="$(curl -s -m 25 -H "Authorization: Bearer $RENDER_API_KEY" \
+                "https://api.render.com/v1/services?limit=1" \
+                | jq -r '.[0].service.ownerId // .[0].service.owner.id // .[0].ownerId // .[0].owner.id // empty')"
+            fi
+            [ -n "$OWNER_ID" ] || { echo "::error::Render ownerId unavailable; set RENDER_OWNER_ID secret"; exit 1; }
+            RESP="$(jq -n \
+              --arg name "$PROJECT" \
+              --arg ownerId "$OWNER_ID" \
+              --arg repo "$REPO_URL" \
+              '{type:"static_site",name:$name,ownerId:$ownerId,repo:$repo,branch:"main",autoDeploy:"yes",serviceDetails:{buildCommand:"",publishPath:"."}}' \
+              | curl -s -m 40 -X POST -H "Authorization: Bearer $RENDER_API_KEY" \
+                -H "Content-Type: application/json" "https://api.render.com/v1/services" --data @-)"
             SVCID="$(echo "$RESP" | jq -r '(.service.id // .id) // empty')"
             [ -n "$SVCID" ] || { echo "::error::Render create failed: $(echo "$RESP" | head -c 300)"; exit 1; }
           else
@@ -476,11 +492,16 @@ jobs:
               -d @/tmp/link_edges.json
           fi
 
-          # 3. t2_build_queue: append this slug to built_slugs, flip done only
+          # 3. t2_build_queue: append feeder slugs to built_slugs, flip done only
           #    once feeder_count is met (structure may need multiple pushes).
           row=$(curl -sf "${RETRY[@]}" "$rest/t2_build_queue?id=eq.$wheel_id&select=built_slugs,feeder_count" "${auth[@]}")
-          built=$(echo "$row" | jq -c --arg s "$slug" '.[0].built_slugs + [$s] | unique')
           feeder_count=$(echo "$row" | jq -r '.[0].feeder_count')
+          node_role="${{ steps.meta.outputs.node_role }}"
+          if [ "$node_role" = "feeder" ]; then
+            built=$(echo "$row" | jq -c --arg s "$slug" '((.[0].built_slugs // []) + [$s]) | unique')
+          else
+            built=$(echo "$row" | jq -c '.[0].built_slugs // []')
+          fi
           count=$(echo "$built" | jq 'length')
           if [ "$count" -ge "$feeder_count" ]; then
             status="done"; done_at_clause=",\"done_at\":\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\""
