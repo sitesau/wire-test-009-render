@@ -44,6 +44,9 @@ name: t2-deploy-writeback
 on:
   push:
     branches: [main]
+    paths-ignore:
+      - ".github/workflows/t2-deploy-writeback.yml"
+      - ".github/workflows/_secret-lencheck.yml"
 
 jobs:
   writeback:
@@ -236,6 +239,7 @@ jobs:
         # any git repo first. Own-host, root, IndexNow applies. Proven live
         # 2026-07-02 via the local script; ported + simplified here.
         if: steps.meta.outputs.present == 'true' && steps.meta.outputs.cloud_host == 'render'
+        id: deploy_render
         env:
           RENDER_API_KEY: ${{ secrets.RENDER_API_KEY }}
           RENDER_OWNER_ID: ${{ secrets.RENDER_OWNER_ID }}
@@ -268,6 +272,22 @@ jobs:
               "https://api.render.com/v1/services/$SVCID/deploys" -d '{}' >/dev/null 2>&1 || true
           fi
           echo "render_service_id=$SVCID" >> "$GITHUB_OUTPUT" 2>/dev/null || true
+          RESOLVED=""
+          for i in {1..24}; do
+            RESOLVED="$(curl -s -m 25 -H "Authorization: Bearer $RENDER_API_KEY" \
+              "https://api.render.com/v1/services/$SVCID" \
+              | jq -r '.service.serviceDetails.url // .service.url // .serviceDetails.url // .url // empty')"
+            [ -n "$RESOLVED" ] && break
+            sleep 5
+          done
+          if [ -z "$RESOLVED" ]; then
+            CANDIDATE="https://${PROJECT}.onrender.com/"
+            if curl -fsS -L --max-time 45 -o /dev/null "$CANDIDATE"; then
+              RESOLVED="$CANDIDATE"
+            fi
+          fi
+          [ -n "$RESOLVED" ] || { echo "::error::Render service URL unavailable for '$PROJECT'"; exit 1; }
+          echo "resolved_url=${RESOLVED%/}/" >> "$GITHUB_OUTPUT"
 
       - name: Deploy (digitalocean)
         # Same simplification as Render: DO App Platform builds straight from
@@ -397,19 +417,24 @@ jobs:
         if: steps.meta.outputs.present == 'true'
         id: verify
         run: |
-          # digitalocean's URL is only known after the deploy step resolved it
-          # (random suffix, not derivable from project name) -- intended_url
-          # would be wrong for this host.
+          # Some hosts resolve the final URL only after the deploy step. Use
+          # that evidence URL instead of the planned intended_url.
           if [ "${{ steps.meta.outputs.cloud_host }}" = "digitalocean" ]; then
             url="${{ steps.deploy_do.outputs.resolved_url }}"
+          elif [ "${{ steps.meta.outputs.cloud_host }}" = "render" ]; then
+            url="${{ steps.deploy_render.outputs.resolved_url }}"
           else
             url="${{ steps.meta.outputs.intended_url }}"
           fi
           code=0
+          effective_url="$url"
           for i in $(seq 1 20); do
-            code=$(curl -s -o /dev/null -w '%{http_code}' "$url" || echo 000)
+            probe="$(curl -s -L -o /dev/null -w '%{http_code} %{url_effective}' "$url" || echo '000 ')"
+            code="${probe%% *}"
+            effective_url="${probe#* }"
+            [ -n "$effective_url" ] || effective_url="$url"
             if [ "$code" = "200" ]; then
-              echo "live_url=$url" >> "$GITHUB_OUTPUT"
+              echo "live_url=$effective_url" >> "$GITHUB_OUTPUT"
               echo "http_code=200" >> "$GITHUB_OUTPUT"
               exit 0
             fi
